@@ -22,6 +22,20 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# 历史上仓储 __init__ 误入队的 DDL（已由 migrations/*.sql 管理）
+_LEGACY_RUNTIME_DDL_MARKERS = (
+    "CREATE TABLE IF NOT EXISTS worldbuilding",
+    "CREATE TABLE IF NOT EXISTS timeline_registries",
+    "CREATE TABLE IF NOT EXISTS confluence_points",
+    "CREATE TABLE IF NOT EXISTS cast_snapshots",
+    "CREATE TABLE IF NOT EXISTS chapter_guardrail_snapshots",
+    "CREATE TABLE IF NOT EXISTS custom_theme_skills",
+)
+
+# 启动竞态产生的重复默认行插入（已由 EmbeddingConfigService 直连写入）
+_LEGACY_IDEMPOTENT_DML_MARKERS = (
+    "INSERT OR IGNORE INTO embedding_config",
+)
 
 from application.engine.services.persistence_command_types import PersistenceCommandType
 
@@ -106,6 +120,8 @@ class PersistentQueueV2:
 
         # 启动时恢复僵尸任务
         self._recover_zombie_tasks()
+        # 清理误入队的运行时 DDL，避免反复执行 CREATE TABLE
+        self._purge_legacy_runtime_ddl_commands()
 
     def _configure_wal_mode(self):
         """配置SQLite WAL模式（性能提升2-3倍）"""
@@ -274,13 +290,6 @@ class PersistentQueueV2:
                 conn.commit()
 
                 commands = [PersistenceCommand.from_row(dict(row)) for row in rows]
-
-                # 统计僵尸任务恢复数
-                zombie_count = sum(1 for c in commands if c.status == 'processing')
-                if zombie_count > 0:
-                    self._stats["zombie_recovered"] += zombie_count
-                    logger.warning(f"恢复了 {zombie_count} 个僵尸任务")
-
                 return commands
 
         except Exception as e:
@@ -384,13 +393,23 @@ class PersistentQueueV2:
 
     def stop_consumer(self):
         """停止消费者线程"""
+        from infrastructure.persistence.database.write_dispatch import (
+            clear_sqlite_writer_thread,
+        )
+
         self._stop_event.set()
         if self._consumer_thread:
             self._consumer_thread.join(timeout=5)
+        clear_sqlite_writer_thread()
         logger.info("🛑 持久化队列消费者已停止")
 
     def _consume_loop(self):
         """消费者主循环"""
+        from infrastructure.persistence.database.write_dispatch import (
+            register_sqlite_writer_thread,
+        )
+
+        register_sqlite_writer_thread()
         logger.info("持久化队列消费者开始轮询...")
 
         while not self._stop_event.is_set():
@@ -403,12 +422,12 @@ class PersistentQueueV2:
                     time.sleep(0.5)
                     continue
 
-                # 处理每个命令
+                # 顺序处理；前一条失败则暂停本批，避免侧表先于 novels 主表执行
                 for command in commands:
                     if self._stop_event.is_set():
                         break
-
-                    self._process_command(command)
+                    if not self._process_command(command):
+                        break
 
                 # 定期清理
                 if self._stats["processed"] % 100 == 0:
@@ -419,9 +438,37 @@ class PersistentQueueV2:
                 time.sleep(1)
 
         logger.info("持久化队列消费者已退出")
+        from infrastructure.persistence.database.write_dispatch import (
+            clear_sqlite_writer_thread,
+        )
 
-    def _process_command(self, command: PersistenceCommand):
-        """处理单个命令"""
+        clear_sqlite_writer_thread()
+
+    def _invoke_handler_with_retry(self, handler: Callable, payload: Dict[str, Any], label: str) -> None:
+        """与 V1 消费者一致：database is locked / busy 时指数退避重试。"""
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                handler(payload)
+                return
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "locked" in msg or "busy" in msg:
+                    if attempt < max_retries - 1:
+                        wait = min(0.2 * (2**attempt), 3.0)
+                        logger.warning(
+                            "DB 被锁，重试 %d/%d (等待%.2fs): %s",
+                            attempt + 1,
+                            max_retries,
+                            wait,
+                            label,
+                        )
+                        time.sleep(wait)
+                        continue
+                raise
+
+    def _process_command(self, command: PersistenceCommand) -> bool:
+        """处理单个命令；返回 False 表示失败且已 nack（调用方应暂停批处理）。"""
         if command.command_type == PersistenceCommandType.BATCH.value:
             for cmd in command.payload.get("commands", []):
                 sub = PersistenceCommand(
@@ -430,25 +477,67 @@ class PersistentQueueV2:
                     priority=command.priority,
                     max_retries=command.max_retries,
                 )
-                self._process_command(sub)
+                if not self._process_command(sub):
+                    self.nack(
+                        command.command_id,
+                        f"batch 子命令失败: {sub.command_type}",
+                        retry=True,
+                    )
+                    return False
             self.ack(command.command_id)
-            return
+            return True
 
         handler = self._handlers.get(command.command_type)
 
         if not handler:
             logger.warning(f"未注册的命令类型: {command.command_type}")
             self.nack(command.command_id, f"未注册的命令类型: {command.command_type}", retry=False)
-            return
+            return False
 
         try:
-            handler(command.payload)
+            self._invoke_handler_with_retry(
+                handler, command.payload, command.command_type
+            )
             self.ack(command.command_id)
+            return True
 
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
             logger.error(f"处理命令失败: {command.command_type}, {error_msg}")
-            self.nack(command.command_id, error_msg, retry=True)
+            retry = True
+            if isinstance(e, sqlite3.IntegrityError) and "FOREIGN KEY" in str(e):
+                retry = False
+            self.nack(command.command_id, error_msg, retry=retry)
+            return False
+
+    def _purge_legacy_runtime_ddl_commands(self) -> None:
+        """将历史误入队的 CREATE TABLE 任务标为已完成（表由 migrations 保证）。"""
+        try:
+            with self._db_pool.get_connection() as conn:
+                purged = 0
+                for marker in (
+                    *_LEGACY_RUNTIME_DDL_MARKERS,
+                    *_LEGACY_IDEMPOTENT_DML_MARKERS,
+                ):
+                    cur = conn.execute(
+                        """UPDATE persistence_queue
+                           SET status = 'completed',
+                               completed_at = CURRENT_TIMESTAMP,
+                               error_message = 'purged_legacy_runtime_ddl'
+                           WHERE command_type = 'execute_sql'
+                             AND status IN ('pending', 'processing')
+                             AND payload LIKE ?""",
+                        (f"%{marker}%",),
+                    )
+                    purged += cur.rowcount
+                conn.commit()
+                if purged:
+                    logger.info(
+                        "已清理 %d 条历史 DDL 队列任务（不再重复执行 CREATE TABLE）",
+                        purged,
+                    )
+        except Exception as e:
+            logger.warning("清理历史 DDL 队列任务失败: %s", e)
 
     def _recover_zombie_tasks(self):
         """启动时恢复僵尸任务（processing超时的任务重置为pending）"""

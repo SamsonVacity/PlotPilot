@@ -339,9 +339,17 @@ def register_persistence_handlers() -> None:
 
         try:
             db = get_database()
+            stripped = sql.strip().upper()
+            if stripped.startswith("CREATE TABLE IF NOT EXISTS"):
+                logger.debug("[PersistenceQueue] EXECUTE_SQL 跳过日志（DDL）: %s", sql[:80])
+            elif "INSERT OR IGNORE INTO EMBEDDING_CONFIG" in stripped:
+                logger.debug("[PersistenceQueue] EXECUTE_SQL 跳过日志（默认嵌入配置）")
             db.execute(sql, params)
             db.get_connection().commit()
-            logger.debug("[PersistenceQueue] EXECUTE_SQL 已执行: %s", sql[:120])
+            if not stripped.startswith("CREATE TABLE IF NOT EXISTS") and (
+                "INSERT OR IGNORE INTO EMBEDDING_CONFIG" not in stripped
+            ):
+                logger.debug("[PersistenceQueue] EXECUTE_SQL 已执行: %s", sql[:120])
         except sqlite3.OperationalError:
             # 必须向上抛：外层 _process_single_command 才对 database locked / busy 退避重试
             raise

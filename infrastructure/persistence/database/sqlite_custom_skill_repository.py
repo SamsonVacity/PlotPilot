@@ -19,29 +19,6 @@ class SqliteCustomSkillRepository:
 
     def __init__(self, db: DatabaseConnection):
         self.db = db
-        self._ensure_table()
-
-    def _ensure_table(self) -> None:
-        """确保表存在（兼容旧数据库）"""
-        sql = """
-            CREATE TABLE IF NOT EXISTS custom_theme_skills (
-                id TEXT PRIMARY KEY,
-                novel_id TEXT NOT NULL,
-                skill_key TEXT NOT NULL,
-                skill_name TEXT NOT NULL,
-                skill_description TEXT DEFAULT '',
-                compatible_genres TEXT DEFAULT '[]',
-                context_prompt TEXT DEFAULT '',
-                beat_prompt TEXT DEFAULT '',
-                beat_triggers TEXT DEFAULT '',
-                audit_checks TEXT DEFAULT '[]',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(novel_id, skill_key)
-            )
-        """
-        self.db.execute(sql)
-        self.db.get_connection().commit()
 
     def save(self, skill_data: Dict[str, Any]) -> None:
         """保存自定义技能（UPSERT）

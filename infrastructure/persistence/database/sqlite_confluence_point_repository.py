@@ -11,37 +11,13 @@ from infrastructure.persistence.database.connection import DatabaseConnection
 
 logger = logging.getLogger(__name__)
 
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS confluence_points (
-    id TEXT PRIMARY KEY,
-    novel_id TEXT NOT NULL,
-    source_storyline_id TEXT NOT NULL,
-    target_storyline_id TEXT NOT NULL,
-    target_chapter INTEGER NOT NULL,
-    merge_type TEXT NOT NULL,
-    context_summary TEXT DEFAULT '',
-    pre_reveal_hint TEXT DEFAULT '',
-    behavior_guards TEXT DEFAULT '[]',
-    resolved INTEGER DEFAULT 0,
-    created_at TEXT,
-    updated_at TEXT
-)
-"""
-
-
 class SqliteConfluencePointRepository(ConfluencePointRepository):
 
     def __init__(self, db: DatabaseConnection):
         self.db = db
-        self._ensure_table()
 
     def _conn(self):
         return self.db.get_connection()
-
-    def _ensure_table(self):
-        conn = self._conn()
-        conn.execute(_CREATE_TABLE_SQL)
-        conn.commit()
 
     def _now(self) -> str:
         return datetime.utcnow().isoformat()

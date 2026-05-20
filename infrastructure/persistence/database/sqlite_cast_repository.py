@@ -26,21 +26,6 @@ class SqliteCastRepository(CastRepository):
             db_connection: DatabaseConnection instance
         """
         self.db = db_connection
-        self._ensure_table()
-
-    def _ensure_table(self) -> None:
-        """Ensure cast_snapshots table exists"""
-        conn = self.db.get_connection()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS cast_snapshots (
-                novel_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                version INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
 
     def save(self, cast_graph: CastGraph) -> None:
         """Save cast graph as JSON blob

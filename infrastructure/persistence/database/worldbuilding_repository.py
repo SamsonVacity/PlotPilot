@@ -12,46 +12,6 @@ class WorldbuildingRepository:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._ensure_table()
-
-    def _ensure_table(self):
-        """确保表存在"""
-        from infrastructure.persistence.database.connection import get_database
-
-        db = get_database(self.db_path)
-        db.execute("""
-                CREATE TABLE IF NOT EXISTS worldbuilding (
-                    id TEXT PRIMARY KEY,
-                    novel_id TEXT NOT NULL UNIQUE,
-
-                    power_system TEXT DEFAULT '',
-                    physics_rules TEXT DEFAULT '',
-                    magic_tech TEXT DEFAULT '',
-
-                    terrain TEXT DEFAULT '',
-                    climate TEXT DEFAULT '',
-                    resources TEXT DEFAULT '',
-                    ecology TEXT DEFAULT '',
-
-                    politics TEXT DEFAULT '',
-                    economy TEXT DEFAULT '',
-                    class_system TEXT DEFAULT '',
-
-                    history TEXT DEFAULT '',
-                    religion TEXT DEFAULT '',
-                    taboos TEXT DEFAULT '',
-
-                    food_clothing TEXT DEFAULT '',
-                    language_slang TEXT DEFAULT '',
-                    entertainment TEXT DEFAULT '',
-
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-                    FOREIGN KEY (novel_id) REFERENCES novels(id) ON DELETE CASCADE
-                )
-            """)
-        db.commit()
 
     def get_by_novel_id(self, novel_id: str) -> Optional[Worldbuilding]:
         """根据小说ID获取世界观"""

@@ -472,6 +472,60 @@ class StateBootstrap:
             logger.debug(f"加载快照失败（可能不存在）: {novel_id}, {e}")
             return []
 
+    def _load_knowledge(self, novel_id: str) -> Optional[Dict[str, Any]]:
+        """加载知识库到共享内存"""
+        try:
+            from domain.novel.value_objects.novel_id import NovelId
+            from infrastructure.persistence.database.connection import get_database
+            from infrastructure.persistence.database.sqlite_knowledge_repository import SqliteKnowledgeRepository
+
+            db = get_database()
+            knowledge_repo = SqliteKnowledgeRepository(db)
+            knowledge = knowledge_repo.get_by_novel_id(NovelId(novel_id))
+
+            if knowledge is None:
+                return None
+
+            # chapters 是 ChapterSummary 对象列表
+            chapters_data = []
+            for ch in (knowledge.chapters or []):
+                if isinstance(ch, dict):
+                    chapters_data.append(ch)
+                else:
+                    chapters_data.append({
+                        "chapter_id": getattr(ch, "chapter_id", ""),
+                        "summary": getattr(ch, "summary", ""),
+                        "key_events": getattr(ch, "key_events", ""),
+                        "open_threads": getattr(ch, "open_threads", ""),
+                    })
+
+            # facts 可能是 Dict 列表或 KnowledgeTriple 对象列表
+            facts_data = []
+            for f in (knowledge.facts or []):
+                if isinstance(f, dict):
+                    facts_data.append(f)
+                else:
+                    facts_data.append({
+                        "id": getattr(f, "id", ""),
+                        "subject": getattr(f, "subject", ""),
+                        "predicate": getattr(f, "predicate", ""),
+                        "object": getattr(f, "object", ""),
+                        "chapter_id": getattr(f, "chapter_id", ""),
+                    })
+
+            knowledge_dict = {
+                "novel_id": novel_id,
+                "chapters": chapters_data,
+                "facts": facts_data,
+            }
+
+            self._shared.set_knowledge(novel_id, knowledge_dict)
+            return knowledge_dict
+
+        except Exception as e:
+            logger.debug(f"加载知识库失败（可能不存在）: {novel_id}, {e}")
+            return None
+
     def _load_chronicles(self, novel_id: str) -> List[Dict[str, Any]]:
         """从共享内存已有的 Bible timeline_notes + snapshots + chapters 实时聚合编年史，写入共享内存缓存。
 

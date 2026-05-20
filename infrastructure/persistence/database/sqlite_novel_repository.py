@@ -117,7 +117,7 @@ class SqliteNovelRepository(NovelRepository):
         else:
             generation_prefs_json = json.dumps(GenerationPreferences().to_dict(), ensure_ascii=False)
 
-        self.db.execute(sql, (
+        params = (
             novel_id,
             novel.title,
             slug,
@@ -149,17 +149,20 @@ class SqliteNovelRepository(NovelRepository):
             audit_progress,
             generation_prefs_json,
             now,
-            now
-        ))
+            now,
+        )
         try:
             from infrastructure.persistence.database.novel_autopilot_state_repository import (
                 NovelAutopilotStateRepository,
             )
 
-            NovelAutopilotStateRepository(self.db).upsert_from_novel(novel)
+            ap_repo = NovelAutopilotStateRepository(self.db)
+            with self.db.transaction() as conn:
+                conn.execute(sql, params)
+                ap_repo.upsert_from_novel(novel, conn=conn)
         except Exception as exc:
             logger.debug("侧表同步跳过（表可能尚未迁移）: %s", exc)
-        self.db.get_connection().commit()
+            self.db.execute(sql, params)
 
     async def async_save(self, novel: Novel) -> None:
         """异步保存小说（守护进程使用）"""
@@ -206,18 +209,20 @@ class SqliteNovelRepository(NovelRepository):
         values.append(novel_id.value)
 
         sql = f"UPDATE novels SET {', '.join(set_clauses)} WHERE id = ?"
-        self.db.execute(sql, tuple(values))
         try:
             from infrastructure.persistence.database.novel_autopilot_state_repository import (
                 NovelAutopilotStateRepository,
             )
 
             merged = self.get_by_id(novel_id)
-            if merged:
-                NovelAutopilotStateRepository(self.db).upsert_from_novel(merged)
+            ap_repo = NovelAutopilotStateRepository(self.db)
+            with self.db.transaction() as conn:
+                conn.execute(sql, tuple(values))
+                if merged:
+                    ap_repo.upsert_from_novel(merged, conn=conn)
         except Exception as exc:
             logger.debug("侧表 patch 跳过: %s", exc)
-        self.db.get_connection().commit()
+            self.db.execute(sql, tuple(values))
 
     def get_by_id(self, novel_id: NovelId) -> Optional[Novel]:
         """根据 ID 获取小说"""

@@ -125,6 +125,18 @@ class TxnCollectingConnection:
         return _EnqueuedStmtCursor()
 
 
+def _persistence_queue_ready() -> bool:
+    from application.engine.services.persistence_queue import get_persistence_queue
+
+    pq = get_persistence_queue()
+    if pq is None:
+        return False
+    if hasattr(pq, "is_ready"):
+        return bool(pq.is_ready())
+    # V1 mp.Queue
+    return pq.get_queue() is not None
+
+
 def enqueue_execute_sql(sql: str, params: Optional[Params] = None) -> bool:
     from application.engine.services.persistence_queue import (
         get_persistence_queue,
@@ -132,7 +144,7 @@ def enqueue_execute_sql(sql: str, params: Optional[Params] = None) -> bool:
     )
 
     pq = get_persistence_queue()
-    if pq is None or pq.get_queue() is None:
+    if not _persistence_queue_ready():
         logger.error("持久化队列未就绪，丢弃写 SQL")
         return False
     plist = list(params) if params is not None else []
@@ -154,7 +166,7 @@ def enqueue_txn_batch(
     if not operations:
         return True
     pq = get_persistence_queue()
-    if pq is None or pq.get_queue() is None:
+    if not _persistence_queue_ready():
         logger.error("持久化队列未就绪，丢弃事务批量写")
         return False
     serializable = [
@@ -174,7 +186,7 @@ def enqueue_delete_chapter(chapter_db_id: str) -> bool:
     )
 
     pq = get_persistence_queue()
-    if pq is None or pq.get_queue() is None:
+    if not _persistence_queue_ready():
         return False
     return pq.push(
         PersistenceCommandType.DELETE_CHAPTER.value,

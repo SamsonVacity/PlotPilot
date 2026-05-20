@@ -19,7 +19,9 @@ class NovelAutopilotStateRepository:
     def __init__(self, db: DatabaseConnection):
         self.db = db
 
-    def upsert_from_novel(self, novel: Novel) -> None:
+    def upsert_from_novel(self, novel: Novel, conn: Any = None) -> None:
+        """写入侧表；conn 为 transaction() 内的连接时与主表同事务入队。"""
+        executor = conn if conn is not None else self.db
         novel_id = novel.novel_id.value if hasattr(novel, "novel_id") else novel.id
         now = datetime.utcnow().isoformat()
 
@@ -28,7 +30,7 @@ class NovelAutopilotStateRepository:
         _cs = getattr(novel, "current_stage", "planning")
         current_stage = _cs.value if isinstance(_cs, NovelStage) else _cs
 
-        self.db.execute(
+        executor.execute(
             """
             INSERT INTO novel_autopilot_states (
                 novel_id, autopilot_status, auto_approve_mode, current_stage,
@@ -71,7 +73,7 @@ class NovelAutopilotStateRepository:
 
         laqs = getattr(novel, "last_audit_quality_scores", {}) or {}
         lai = getattr(novel, "last_audit_issues", []) or []
-        self.db.execute(
+        executor.execute(
             """
             INSERT INTO novel_audit_snapshots (
                 novel_id, last_audit_chapter_number, last_audit_similarity,

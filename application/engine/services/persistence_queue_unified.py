@@ -39,7 +39,16 @@ class UnifiedPersistenceQueue:
             logger.debug("inject_queue 已忽略（使用 SQLite V2 跨进程队列）")
 
     def get_queue(self):
+        """V1 mp.Queue 兼容；V2 跨进程走 SQLite 队列表，此处恒为 None。"""
         return None
+
+    def is_ready(self) -> bool:
+        """写分发是否可将 SQL 入队（V2 已初始化即可，不要求 mp.Queue）。"""
+        try:
+            self._get_v2()
+            return True
+        except Exception:
+            return False
 
     def register_handler(self, command_type: str, handler: Callable) -> None:
         self._get_v2().register_handler(command_type, handler)

@@ -19,19 +19,6 @@ class SqliteTimelineRepository(TimelineRepository):
 
     def __init__(self, db: DatabaseConnection):
         self.db = db
-        self._ensure_table()
-
-    def _ensure_table(self) -> None:
-        """确保表存在"""
-        self.db.execute("""
-            CREATE TABLE IF NOT EXISTS timeline_registries (
-                novel_id TEXT PRIMARY KEY,
-                data JSON NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn = self.db.get_connection()
-        conn.commit()
 
     def save(self, registry: TimelineRegistry) -> None:
         """保存时间线注册表"""
