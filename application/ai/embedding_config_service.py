@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -62,6 +63,9 @@ class EmbeddingConfigService:
     - 所有写操作更新 updated_at
     """
 
+    _ensure_lock = threading.Lock()
+    _row_ensured = False
+
     _DEFAULTS = {
         "id": "default",
         "mode": "openai",
@@ -84,41 +88,60 @@ class EmbeddingConfigService:
         return get_database()
 
     def _ensure_row(self) -> None:
-        """确保存在默认配置行（幂等）。"""
-        db = self._get_db()
-        row = db.execute(
-            "SELECT id FROM embedding_config WHERE id = ? LIMIT 1",
-            ("default",),
-        ).fetchone()
-        if row:
+        """确保存在默认配置行（幂等、进程内只写一次）。
+
+        禁止经持久化队列入队 INSERT：异步写入会导致并发启动时多次读到「无行」而重复入队。
+        """
+        if EmbeddingConfigService._row_ensured:
             return
-        now = datetime.now().isoformat()
-        db.execute("""
-            INSERT OR IGNORE INTO embedding_config
-            (id, mode, api_key, base_url, model, use_gpu, model_path, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            "default",
-            "openai",
-            "",
-            "",
-            (os.getenv("EMBEDDING_MODEL") or "").strip(),
-            1,
-            (os.getenv("LOCAL_EMBEDDING_MODEL_PATH") or "").strip(),
-            now,
-            now,
-        ))
-        db.get_connection().commit()
-        logger.info("EmbeddingConfigService: 已初始化默认嵌入配置")
+
+        with EmbeddingConfigService._ensure_lock:
+            if EmbeddingConfigService._row_ensured:
+                return
+
+            db = self._get_db()
+            row = db.fetch_one(
+                "SELECT id FROM embedding_config WHERE id = ? LIMIT 1",
+                ("default",),
+            )
+            if row:
+                EmbeddingConfigService._row_ensured = True
+                return
+
+            now = datetime.now().isoformat()
+            # 默认行必须同步落库；经持久化队列入队会导致并发启动重复 INSERT
+            conn = db.get_connection()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO embedding_config
+                (id, mode, api_key, base_url, model, use_gpu, model_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "default",
+                    "openai",
+                    "",
+                    "",
+                    (os.getenv("EMBEDDING_MODEL") or "").strip(),
+                    1,
+                    (os.getenv("LOCAL_EMBEDDING_MODEL_PATH") or "").strip(),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+            EmbeddingConfigService._row_ensured = True
+            logger.info("EmbeddingConfigService: 已初始化默认嵌入配置")
 
     def get_config(self) -> EmbeddingConfigModel:
         """获取当前嵌入配置。"""
         self._ensure_row()
         db = self._get_db()
-        row = db.execute(
+        row = db.fetch_one(
             "SELECT * FROM embedding_config WHERE id = ? LIMIT 1",
             ("default",),
-        ).fetchone()
+        )
         if not row:
             # 兜底：返回默认模型
             return EmbeddingConfigModel()

@@ -27,6 +27,23 @@ class OpenAIProvider(BaseProvider):
     # 静态类级别缓存：记录哪些 base_url 不支持 Responses API，从而避免重复降级带来的延迟开销
     _fallback_to_chat_cache: set[str] = set()
 
+    @staticmethod
+    def _responses_api_should_fallback(exc: BaseException) -> bool:
+        """第三方网关常导致 Responses 流式 SDK 解析失败，应降级 Chat Completions。"""
+        if isinstance(exc, (openai.NotFoundError, openai.BadRequestError)):
+            return True
+        msg = str(exc).lower()
+        markers = (
+            "404",
+            "not found",
+            "400",
+            "account invalid",
+            "invalid_argument",
+            "__discriminator__",
+            "typing.union",
+        )
+        return any(m in msg for m in markers)
+
     def __init__(self, settings: Settings):
         super().__init__(settings)
 
@@ -78,9 +95,12 @@ class OpenAIProvider(BaseProvider):
                     logger.info(f"Responses API unsupported for {base_url}, falling back to chat completions: {str(e)}")
                     self.__class__._fallback_to_chat_cache.add(base_url)
                 except Exception as e:
-                    # 某些网关在路径错误时可能不抛严格的 404 而是抛出其他错误，如果消息含有明确路径错误也尝试降级
-                    if "404" in str(e) or "Not Found" in str(e) or "400" in str(e) or "Account invalid" in str(e) or "INVALID_ARGUMENT" in str(e):
-                        logger.info(f"Gateway returned error for Responses API ({base_url}), falling back: {str(e)}")
+                    if self._responses_api_should_fallback(e):
+                        logger.info(
+                            "Responses API failed for %s, falling back to chat completions: %s",
+                            base_url,
+                            e,
+                        )
                         self.__class__._fallback_to_chat_cache.add(base_url)
                     else:
                         raise
@@ -155,13 +175,21 @@ class OpenAIProvider(BaseProvider):
                         if content:
                             yield content
                     return  # 正常完成则结束 generator
-                except (openai.NotFoundError, openai.BadRequestError):
+                except (openai.NotFoundError, openai.BadRequestError) as e:
                     self.__class__._fallback_to_chat_cache.add(base_url)
-                    logger.info(f"Stream: Responses API unsupported for {base_url}, falling back.")
+                    logger.info(
+                        "Stream: Responses API unsupported for %s, falling back: %s",
+                        base_url,
+                        e,
+                    )
                 except Exception as e:
-                    if "404" in str(e) or "Not Found" in str(e) or "400" in str(e) or "Account invalid" in str(e) or "INVALID_ARGUMENT" in str(e):
+                    if self._responses_api_should_fallback(e):
                         self.__class__._fallback_to_chat_cache.add(base_url)
-                        logger.info(f"Stream: Gateway returned error for Responses API ({base_url}), falling back.")
+                        logger.info(
+                            "Stream: Responses API failed for %s, falling back to chat: %s",
+                            base_url,
+                            e,
+                        )
                     else:
                         logger.error(f"[Responses Stream] Failed: {e}")
                         raise
@@ -288,19 +316,26 @@ class OpenAIProvider(BaseProvider):
 
     @staticmethod
     def _extract_text_from_responses_chunk(chunk: Any) -> str:
-        """原生 Responses stream 解析封装"""
+        """原生 Responses stream 解析封装（兼容官方与部分网关事件名）。"""
         try:
-            event_type = getattr(chunk, "type", "")
+            event_type = getattr(chunk, "type", "") or ""
+            if event_type in (
+                "response.output_text.delta",
+                "response.text.delta",
+            ):
+                delta = getattr(chunk, "delta", None)
+                if isinstance(delta, str):
+                    return delta
             if event_type == "response.content_part.added":
                 part = getattr(chunk, "part", None)
                 if part and getattr(part, "type", "") == "text":
-                    return getattr(part, "text", "")
-            elif event_type == "message.delta":
+                    return getattr(part, "text", "") or ""
+            if event_type == "message.delta":
                 delta = getattr(chunk, "delta", None)
                 if delta:
-                     content = getattr(delta, "content", None)
-                     if isinstance(content, str):
-                         return content
+                    content = getattr(delta, "content", None)
+                    if isinstance(content, str):
+                        return content
         except Exception:
             pass
         return ""
@@ -360,22 +395,6 @@ class OpenAIProvider(BaseProvider):
                 logger.debug("message.content 为空但有 reasoning_content，模型可能只输出了推理")
 
         return result
-
-    @staticmethod
-    def _extract_text_from_stream_chunk(chunk: Any) -> str:
-        if not getattr(chunk, "choices", None):
-            # 🔥 容错：部分网关返回的流式 chunk 没有 choices 字段
-            # 例如 DeepSeek-R1 的 reasoning_content 字段在顶层
-            return ""
-
-        choice = chunk.choices[0]
-        delta = getattr(choice, "delta", None)
-        content = getattr(delta, "content", None)
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return OpenAIProvider._normalize_chat_completion_content(content)
-        return ""
 
     @staticmethod
     def _extract_text_from_stream_chunk(chunk: Any) -> str:
