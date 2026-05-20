@@ -184,6 +184,10 @@ async def generate_bible(
     Returns:
         202 Accepted，表示生成任务已启动
     """
+    from application.ai.llm_runtime_guard import require_llm_configured
+
+    require_llm_configured()
+
     async def _generate_task():
         logger.info("Bible generation task started for %s, stage=%s", novel_id, stage)
         clear_bible_generation_state(novel_id)
@@ -247,56 +251,119 @@ def _sse_fmt(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def _parse_dimension_json(raw_text: str, dim_key: str) -> dict:
-    """解析 LLM 流式输出的维度 JSON，返回 {field_key: field_value} 字典。"""
-    from application.world.services.auto_bible_generator import (
-        _sanitize_llm_json_output,
-        _repair_json_string,
+def _normalize_worldbuilding_payload(raw: dict) -> dict:
+    """从一次性 LLM 结果中提取五维 worldbuilding dict。"""
+    if not isinstance(raw, dict):
+        return {}
+    wb = raw.get("worldbuilding")
+    if isinstance(wb, dict) and wb:
+        return wb
+    dim_keys = ("core_rules", "geography", "society", "culture", "daily_life")
+    if any(k in raw for k in dim_keys):
+        return {k: raw.get(k) or {} for k in dim_keys if isinstance(raw.get(k), dict)}
+    return {}
+
+
+async def _sse_emit_worldbuilding_stream(
+    novel_id: str,
+    premise: str,
+    target_chapters: int,
+    bible_generator: AutoBibleGenerator,
+):
+    """单次 LLM 真流式 + 增量解析，推送 dim_chunk / field / phase。"""
+    from application.world.worldbuilding_stream_parse import (
+        DIM_LABELS,
+        WorldbuildingStreamParser,
+        WORLDBUILDING_DIM_KEYS,
     )
 
-    content = _sanitize_llm_json_output(raw_text)
-    if not content:
-        return {}
+    yield _sse_fmt(
+        "phase",
+        {"phase": "worldbuilding", "message": "AI 正在流式构建世界观..."},
+    )
+    await asyncio.sleep(0)
 
-    # 尝试解析 JSON
-    parsed = None
-    for attempt in range(3):
-        try:
-            parsed = json.loads(content)
-            break
-        except (json.JSONDecodeError, ValueError):
-            if attempt == 0:
-                content = _repair_json_string(content)
-            elif attempt == 1:
-                # 尝试提取最外层 JSON 对象
-                start = content.find("{")
-                end = content.rfind("}")
-                if start != -1 and end > start:
-                    content = content[start:end + 1]
-                    content = _repair_json_string(content)
+    parser = WorldbuildingStreamParser()
+    style_saved = False
 
-    if not isinstance(parsed, dict):
-        return {}
+    try:
+        async for token in bible_generator.stream_worldbuilding_and_style(
+            premise, target_chapters
+        ):
+            for ev in parser.feed(token):
+                kind = ev.get("kind")
+                if kind == "dim_chunk":
+                    yield _sse_fmt(
+                        "data",
+                        {
+                            "type": "worldbuilding_dim_chunk",
+                            "dimension": ev["dimension"],
+                            "chunk": ev["chunk"],
+                        },
+                    )
+                elif kind == "phase_dim":
+                    dim_key = ev["dimension"]
+                    label = DIM_LABELS.get(dim_key, dim_key)
+                    yield _sse_fmt(
+                        "phase",
+                        {
+                            "phase": f"worldbuilding_{dim_key}",
+                            "message": f"正在生成{label}...",
+                        },
+                    )
+                elif kind == "style" and not style_saved:
+                    style_saved = True
+                    style_text = (ev.get("content") or "").strip()
+                    if style_text:
+                        yield _sse_fmt("data", {"type": "style", "content": style_text})
+                        try:
+                            bible_generator.bible_service.add_style_note(
+                                novel_id=novel_id,
+                                note_id=f"{novel_id}-style-1",
+                                category="文风公约",
+                                content=style_text,
+                            )
+                        except Exception:
+                            pass
+                elif kind == "field":
+                    yield _sse_fmt(
+                        "data",
+                        {
+                            "type": "worldbuilding_field",
+                            "dimension": ev["dimension"],
+                            "field": ev["field"],
+                            "value": ev["value"],
+                        },
+                    )
+    except Exception as e:
+        logger.error("Stream worldbuilding SSE failed: %s", e, exc_info=True)
+        yield _sse_fmt("error", {"message": f"世界观生成失败: {e}"})
+        return
 
-    # LLM 可能多包一层：{"worldbuilding": {dim_key: {...}}} 或单键 {"dim_key": {...}}
-    wb_outer = parsed.get("worldbuilding")
-    if isinstance(wb_outer, dict):
-        wb_inner = wb_outer.get(dim_key)
-        if isinstance(wb_inner, dict):
-            parsed = wb_inner
-    if len(parsed) == 1:
-        lone_k, lone_v = next(iter(parsed.items()))
-        if lone_k == dim_key and isinstance(lone_v, dict):
-            parsed = lone_v
+    accumulated_wb = parser.finalize()
+    if not any(accumulated_wb.values()):
+        yield _sse_fmt("error", {"message": "世界观解析结果为空，请重试"})
+        return
 
-    # 标准化：只保留字符串字段
-    normalized = {}
-    for k, v in parsed.items():
-        if isinstance(v, str) and v.strip():
-            normalized[k] = v.strip()
-        elif isinstance(v, (list, dict)):
-            normalized[k] = str(v)
-    return normalized
+    for dim_key in WORLDBUILDING_DIM_KEYS:
+        dim_data = accumulated_wb.get(dim_key) or {}
+        if not dim_data:
+            continue
+        yield _sse_fmt(
+            "data",
+            {
+                "type": "worldbuilding_dimension",
+                "dimension": dim_key,
+                "content": dim_data,
+            },
+        )
+
+    try:
+        await bible_generator._save_worldbuilding(novel_id, accumulated_wb)
+    except Exception as e:
+        logger.warning("Failed to save worldbuilding (stream): %s", e)
+
+    yield _sse_fmt("phase", {"phase": "worldbuilding_done", "message": "世界观生成完成！"})
 
 
 async def _sse_bible_generator(
@@ -340,93 +407,11 @@ async def _sse_bible_generator(
 
     try:
         if stage in ("all", "worldbuilding"):
-            # ── 世界观生成（逐维度流式） ──
-            yield _sse_fmt("phase", {"phase": "worldbuilding", "message": "AI 正在构建世界观（5维度框架）..."})
-            await asyncio.sleep(0)
-
-            # 1. 先生成文风公约（快速，独立调用）
-            yield _sse_fmt("phase", {"phase": "worldbuilding_style", "message": "正在生成文风公约..."})
-            await asyncio.sleep(0)
-            try:
-                style_text = await bible_generator._generate_style(premise, novel.target_chapters)
-                if style_text:
-                    yield _sse_fmt("data", {"type": "style", "content": style_text})
-                    # 保存文风
-                    try:
-                        bible_generator.bible_service.add_style_note(
-                            novel_id=novel_id,
-                            note_id=f"{novel_id}-style-1",
-                            category="文风公约",
-                            content=style_text,
-                        )
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning("Style generation failed (non-fatal): %s", e)
-
-            # 2. 逐维度流式生成世界观（每维度一次 LLM 流式请求，边接收 token 边推送）
-            dim_keys = ["core_rules", "geography", "society", "culture", "daily_life"]
-            dim_labels = {
-                "core_rules": "核心法则",
-                "geography": "地理生态",
-                "society": "社会结构",
-                "culture": "历史文化",
-                "daily_life": "沉浸感细节",
-            }
-            accumulated_wb: dict = {}  # 已生成的维度数据，用于上下文传递
-
-            for dim_key in dim_keys:
-                dim_label = dim_labels[dim_key]
-
-                # 通知前端"即将生成该维度"
-                yield _sse_fmt("phase", {"phase": f"worldbuilding_{dim_key}", "message": f"正在构建{dim_label}..."})
-                await asyncio.sleep(0)
-
-                # ── 维度级流式：一次 LLM 调用流式输出整个维度 JSON ──
-                # 逐 token 推送 worldbuilding_dim_chunk（前端可逐字看到内容）
-                # 维度完成后推送每个字段的 worldbuilding_field 事件
-                try:
-                    parts: list[str] = []
-                    async for chunk in bible_generator._stream_single_dimension(
-                        premise, novel.target_chapters, dim_key, accumulated_wb,
-                    ):
-                        parts.append(chunk)
-                        # 逐 token 推送 SSE（让前端看到逐字生成）
-                        yield _sse_fmt("data", {
-                            "type": "worldbuilding_dim_chunk",
-                            "dimension": dim_key,
-                            "chunk": chunk,
-                        })
-                        await asyncio.sleep(0)
-
-                    full_text = "".join(parts).strip()
-                    dim_data = _parse_dimension_json(full_text, dim_key)
-                except Exception as e:
-                    logger.error("Failed to stream dimension %s: %s", dim_key, e)
-                    dim_data = {}
-
-                if dim_data:
-                    accumulated_wb[dim_key] = dim_data
-                    # 逐字段推送完整的字段值（前端更新最终状态）
-                    for field_key, field_value in dim_data.items():
-                        if field_value:
-                            yield _sse_fmt("data", {
-                                "type": "worldbuilding_field",
-                                "dimension": dim_key,
-                                "field": field_key,
-                                "value": field_value,
-                            })
-                            await asyncio.sleep(0.05)
-
-                    # 即时保存该维度到数据库
-                    try:
-                        await bible_generator._save_worldbuilding(novel_id, {dim_key: dim_data})
-                    except Exception as e:
-                        logger.warning("Failed to save dimension %s via SSE: %s", dim_key, e)
-
-                await asyncio.sleep(0.1)  # 给前端渲染数据的时间
-
-            yield _sse_fmt("phase", {"phase": "worldbuilding_done", "message": "世界观生成完成！"})
+            # ── 世界观：单次 LLM 真流式 + 增量解析 ──
+            async for event in _sse_emit_worldbuilding_stream(
+                novel_id, premise, novel.target_chapters, bible_generator
+            ):
+                yield event
 
         if stage in ("all", "characters"):
             # ── 人物生成（流式 LLM） ──
@@ -578,6 +563,10 @@ async def generate_bible_stream(
     - done: 全部完成
     - error: 错误
     """
+    from application.ai.llm_runtime_guard import require_llm_configured
+
+    require_llm_configured()
+
     return StreamingResponse(
         _sse_bible_generator(novel_id, stage, bible_generator, knowledge_generator),
         media_type="text/event-stream",

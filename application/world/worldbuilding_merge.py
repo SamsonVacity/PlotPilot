@@ -26,6 +26,58 @@ _LEGACY_KEYS_BY_DIMENSION: Dict[str, Tuple[str, ...]] = {
     "daily_life": ("food_clothing", "language_slang", "entertainment"),
 }
 
+# SSE / LLM 流式解析允许的字段白名单（与 AutoBibleGenerator._DIMENSION_DEFS 对齐）
+WORLD_BUILDING_FIELDS_BY_DIMENSION: Dict[str, Tuple[str, ...]] = {
+    "core_rules": (
+        "power_system",
+        "physics_rules",
+        "magic_tech",
+        "cost_and_limitation",
+        "resource_scarcity",
+    ),
+    "geography": (
+        "terrain",
+        "climate",
+        "resources",
+        "ecology",
+        "forbidden_zones",
+        "urban_core",
+        "hidden_realms",
+    ),
+    "society": (
+        "politics",
+        "economy",
+        "class_system",
+        "power_structure",
+        "oppression_mechanism",
+        "class_division",
+    ),
+    "culture": (
+        "history",
+        "religion",
+        "taboos",
+        "worship",
+        "oaths_and_curses",
+    ),
+    "daily_life": (
+        "food_clothing",
+        "language_slang",
+        "entertainment",
+        "survival_tactics",
+        "market_reality",
+        "food_and_drink",
+        "slang_and_profanity",
+    ),
+}
+
+
+def filter_dimension_fields(dim: str, fields: Dict[str, str]) -> Dict[str, str]:
+    """仅保留该维度白名单内的字段，丢弃嵌套对象误解析出的键（如 name/essence）。"""
+    allowed = frozenset(WORLD_BUILDING_FIELDS_BY_DIMENSION.get(dim, ()))
+    if not allowed:
+        return {}
+    return {k: v for k, v in fields.items() if k in allowed and str(v).strip()}
+
 
 def empty_worldbuilding_slices() -> Dict[str, Dict[str, str]]:
     return {k: {} for k in WORLD_BUILDING_DIMENSION_KEYS}

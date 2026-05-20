@@ -111,10 +111,14 @@ class TestGetBible:
         assert data["characters"] == []
         assert data["world_settings"] == []
 
-    def test_get_bible_wrong_novel(self):
-        """测试从不存在的小说获取 Bible"""
+    def test_get_bible_lazy_created_for_unknown_novel_id(self):
+        """未知 novel_id 也会惰性创建占位 Novel + 空 Bible（与 create_bible 一致）。"""
         response = client.get("/api/v1/bible/novels/wrong-novel-id/bible")
-        assert response.status_code == 404
+        assert response.status_code == 200
+        data = response.json()
+        assert data["novel_id"] == "wrong-novel-id"
+        assert data["id"] == "wrong-novel-id-bible"
+        assert data["characters"] == []
 
 
 class TestListCharacters:

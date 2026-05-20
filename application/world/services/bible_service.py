@@ -361,19 +361,14 @@ class BibleService:
         return BibleDTO.from_domain(bible)
 
     def ensure_bible_for_novel(self, novel_id: str) -> BibleDTO:
-        """若小说已在库但未建 Bible 行，则创建空 Bible 并返回。
+        """若尚无 Bible 行则创建空 Bible 并返回（与 create_bible 占位逻辑一致）。
 
-        新书创建后轮询工作台时常见「先读到小说再读 Bible」，避免无端 404。
-        若 novel_id 指向的小说不存在：抛出 EntityNotFoundError(Novel)。
+        新书向导/工作台首屏可能在 novels 主表落库前发起 GET；create_bible 会写入占位
+        Novel，避免无端 404。
         """
         dto = self.get_bible_by_novel(novel_id)
         if dto is not None:
             return dto
-        if self._novel_repository is None:
-            raise EntityNotFoundError("Bible", f"for novel {novel_id}")
-        novel = self._novel_repository.get_by_id(NovelId(novel_id))
-        if novel is None:
-            raise EntityNotFoundError("Novel", novel_id)
         return self.create_bible(f"{novel_id}-bible", novel_id)
 
     def update_bible(

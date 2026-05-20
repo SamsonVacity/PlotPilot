@@ -249,6 +249,14 @@ export async function consumeBibleGenerateStream(
     signal?: AbortSignal
   }
 ): Promise<void> {
+  const { ensureLlmConfigured, parseLlmNotConfiguredDetail } = await import(
+    '@/utils/llmRuntimeGate'
+  )
+  if (!(await ensureLlmConfigured())) {
+    handlers.onError?.('未配置大模型，已取消生成')
+    return
+  }
+
   const url = resolveHttpUrl(`/api/v1/bible/novels/${novelId}/generate-stream?stage=${stage}`)
   const res = await fetch(url, {
     method: 'POST',
@@ -258,7 +266,17 @@ export async function consumeBibleGenerateStream(
   })
   if (!res.ok || !res.body) {
     const t = await res.text().catch(() => '')
-    handlers.onError?.(t || `HTTP ${res.status}`)
+    let errMsg = t || `HTTP ${res.status}`
+    if (res.status === 503) {
+      try {
+        const body = JSON.parse(t) as { detail?: unknown }
+        const parsed = parseLlmNotConfiguredDetail(body.detail)
+        if (parsed) errMsg = parsed
+      } catch {
+        /* ignore */
+      }
+    }
+    handlers.onError?.(errMsg)
     return
   }
 
