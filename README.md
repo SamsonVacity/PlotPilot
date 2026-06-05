@@ -1,6 +1,6 @@
 # PlotPilot（墨枢）
 
->大家PR和ISSUE都看到，休息一段时间后审阅哈~
+>大家PR和ISSUE都看到，莫急PR，莫急PR，最近要重大更新，很多核心链路变化~
 
 <p align="center">
   <img src="docs/plotpilot-readme.256.png" alt="PlotPilot 墨枢" width="120" />
