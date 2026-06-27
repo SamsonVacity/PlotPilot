@@ -54,6 +54,15 @@ class OpenAIProvider(BaseProvider):
         client_kwargs["http_client"] = self._http_client
         self.async_client = AsyncOpenAI(**client_kwargs)
 
+    async def _call_llm_with_timeout(self, coro, operation: str = "LLM call"):
+        """Hard timeout - asyncio.wait_for kills the call even when
+        httpx.Timeout fails (e.g. CLOSE-WAIT after remote FIN)."""
+        timeout = getattr(self.settings, 'timeout_seconds', 300) or 300
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError("{} timed out after {}s".format(operation, timeout))
+
     async def generate(
         self,
         prompt: Prompt,
@@ -101,7 +110,7 @@ class OpenAIProvider(BaseProvider):
             request_kwargs = self._build_chat_request_kwargs(messages, config)
             try:
                 try:
-                    response = await self.async_client.chat.completions.create(**request_kwargs)
+                    response = await self._call_llm_with_timeout(self.async_client.chat.completions.create(**request_kwargs), "chat.completions.create")
                 except (openai.BadRequestError, openai.NotFoundError) as e:
                     # 🔥 json_schema 不支持时自动降级
                     if config.response_format and config.response_format.get("type") == "json_schema":
@@ -112,7 +121,7 @@ class OpenAIProvider(BaseProvider):
                         )
                         self.__class__._json_schema_unsupported_cache.add(base_url)
                         request_kwargs["response_format"] = {"type": "json_object"}
-                        response = await self.async_client.chat.completions.create(**request_kwargs)
+                        response = await self._call_llm_with_timeout(self.async_client.chat.completions.create(**request_kwargs), "chat.completions.create")
                     else:
                         raise
 
@@ -186,7 +195,7 @@ class OpenAIProvider(BaseProvider):
             # 降级：走原来的 Chat Completions 流式 API
             messages = self._build_messages(prompt)
             request_kwargs = self._build_chat_request_kwargs(messages, config, stream=True)
-            stream = await self.async_client.chat.completions.create(**request_kwargs)
+            stream = await self._call_llm_with_timeout(self.async_client.chat.completions.create(**request_kwargs), "chat.completions.create (stream)")
             async for chunk in stream:
                 content = self._extract_text_from_stream_chunk(chunk)
                 if content:
@@ -279,7 +288,7 @@ class OpenAIProvider(BaseProvider):
     async def _generate_via_responses(self, prompt: Prompt, config: GenerationConfig) -> GenerationResult:
         """Responses API 非流式生成"""
         request_kwargs = self._build_responses_request_kwargs(prompt, config)
-        response = await self.async_client.responses.create(**request_kwargs)
+        response = await self._call_llm_with_timeout(self.async_client.responses.create(**request_kwargs), "responses.create")
 
         output = getattr(response, "output", None)
         content_parts: list[str] = []
@@ -415,9 +424,9 @@ class OpenAIProvider(BaseProvider):
         return ""
 
     async def _generate_via_stream(self, request_kwargs: dict[str, Any]) -> tuple[str, TokenUsage]:
-        stream = await self.async_client.chat.completions.create(
+        stream = await self._call_llm_with_timeout(self.async_client.chat.completions.create(
             **{**request_kwargs, "stream": True}
-        )
+        ), "chat.completions.create (stream)")
 
         parts: list[str] = []
         input_tokens = 0

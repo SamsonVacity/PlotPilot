@@ -21,7 +21,7 @@ async function bootstrap() {
   app.use(router)
   app.use(installNaiveComponents)
 
-  // Tauri 下须先拿到真实端口再挂路由，否则首屏请求会打到错误 origin（抽屉/广场像「没连上库」）
+  // Tauri 下须先拿到真实端口再挂路由，否则首屏请求会打到错误 origin
   try {
     await initApiClient()
   } catch (err) {

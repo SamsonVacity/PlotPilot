@@ -10,7 +10,7 @@ const CharacterSchedulerSimulator = () =>
   import('../components/debug/CharacterSchedulerSimulator.vue')
 
 const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHistory("/moshu/"),
   routes: [
     { path: '/', name: 'Home', component: Home },
     { path: '/book/:slug/workbench', name: 'Workbench', component: Workbench },
