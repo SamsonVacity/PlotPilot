@@ -454,6 +454,23 @@ class StateBootstrap:
             logger.debug(f"加载三元组失败（可能不存在）: {novel_id}, {e}")
             return []
 
+
+    def _load_knowledge(self, novel_id: str) -> Optional[Dict[str, Any]]:
+        """加载叙事知识到共享内存（组合 Bible + 三元组）
+
+        供 _fallback_workbench_from_db 使用，
+        在一次调用中返回世界观设定和知识图谱三元组。
+        """
+        try:
+            bible = self._load_bible(novel_id)
+            triples = self._load_triples(novel_id)
+            return {
+                "bible": bible,
+                "triples": triples,
+            }
+        except Exception as e:
+            logger.debug(f"加载叙事知识失败: {novel_id}, {e}")
+            return None
     def _run_async_triple_fetch(self, novel_id: str, coroutine_factory) -> List[Any]:
         """Bridge async triple fetch with a bounded bootstrap timeout."""
         try:
