@@ -31,7 +31,7 @@ function isTauri(): boolean {
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
 
 const axiosInstance = axios.create({
-  baseURL: '',
+  baseURL: API_BASE_URL,
   timeout: runtimePerformance.network.apiDefaultTimeoutMs,
   headers: {
     'Content-Type': 'application/json',
