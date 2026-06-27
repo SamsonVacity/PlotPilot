@@ -31,7 +31,7 @@ function isTauri(): boolean {
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
 
 const axiosInstance = axios.create({
-  baseURL: API_BASE_URL,
+  baseURL: '',
   timeout: runtimePerformance.network.apiDefaultTimeoutMs,
   headers: {
     'Content-Type': 'application/json',
@@ -41,9 +41,11 @@ const axiosInstance = axios.create({
 /** 与 apiClient 同一实例，供需完整 Axios 配置（timeout、params）的模块使用 */
 export const apiAxios = axiosInstance
 
-/** 旧版 /api 路由（book、jobs），与 v1 共用主机 */
+/**
+ * 旧版 /api 路由（book、jobs），与 v1 共用主机
+ */
 export const legacyBookHttp = axios.create({
-  baseURL: '/api',
+  baseURL: (API_BASE_URL || '/api/v1').replace(/\/v1\/?$/, ''),
   timeout: runtimePerformance.network.legacyApiTimeoutMs,
   headers: {
     'Content-Type': 'application/json',
@@ -51,9 +53,11 @@ export const legacyBookHttp = axios.create({
 })
 legacyBookHttp.interceptors.response.use(response => response.data)
 
-/** 旧版 /api/stats，带 SuccessResponse 解包 */
+/**
+ * 旧版 /api/stats，带 SuccessResponse 解包
+ */
 export const legacyStatsHttp = axios.create({
-  baseURL: '/api',
+  baseURL: (API_BASE_URL || '/api/v1').replace(/\/v1\/?$/, ''),
   timeout: runtimePerformance.network.legacyApiTimeoutMs,
   headers: {
     'Content-Type': 'application/json',
@@ -73,17 +77,6 @@ legacyStatsHttp.interceptors.response.use(response => {
   return body
 })
 
-function syncLegacyRootsFromV1(): void {
-  const v1 = axiosInstance.defaults.baseURL || '/api/v1'
-  if (/^https?:\/\//i.test(v1)) {
-    const origin = new URL(v1).origin
-    legacyBookHttp.defaults.baseURL = `${origin}/api`
-    legacyStatsHttp.defaults.baseURL = `${origin}/api`
-  } else {
-    legacyBookHttp.defaults.baseURL = '/api'
-    legacyStatsHttp.defaults.baseURL = '/api'
-  }
-}
 
 /**
  * 将必须以 `/` 开头的绝对路径（如 `/api/v1/...`）转为实际请求 URL。
@@ -93,11 +86,15 @@ export function resolveHttpUrl(absolutePathFromRoot: string): string {
   if (!absolutePathFromRoot.startsWith('/')) {
     throw new Error(`resolveHttpUrl: path must start with /, got: ${absolutePathFromRoot}`)
   }
-  const v1 = axiosInstance.defaults.baseURL || '/api/v1'
+  const v1 = API_BASE_URL || '/api/v1'
   if (/^https?:\/\//i.test(v1)) {
     return `${new URL(v1).origin}${absolutePathFromRoot}`
   }
-  return absolutePathFromRoot
+  if (!v1.startsWith('/')) {
+    return absolutePathFromRoot
+  }
+  const apiBase = v1.replace(/\/api\/v1\/?$/, '').replace(/\/api\/?$/, '')
+  return absolutePathFromRoot.replace(/^\/api/, `${apiBase}/api`)
 }
 
 async function initTauriConnection(): Promise<void> {
@@ -199,7 +196,6 @@ async function ensureTauriBackendReady(): Promise<void> {
       throw new Error(`Tauri 后端健康检查未通过: 127.0.0.1:${port}`)
     }
     axiosInstance.defaults.baseURL = `http://127.0.0.1:${port}/api/v1`
-    syncLegacyRootsFromV1()
     console.log(`[API] 桌面模式 baseURL: ${axiosInstance.defaults.baseURL}`)
   })()
 
@@ -250,7 +246,6 @@ export async function initApiClient(): Promise<void> {
     console.warn('[API] Tauri 下未能通过 IPC 取得端口，等待请求门禁继续处理')
   }
 
-  syncLegacyRootsFromV1()
   await initTauriConnection()
 }
 
@@ -266,10 +261,7 @@ function formatAxiosUserSummary(err: AxiosError): string {
   return msg.length > 0 ? msg : '网络或接口异常'
 }
 
-axiosInstance.interceptors.request.use(async config => {
-  await ensureTauriBackendReady()
-  return config
-})
+
 
 axiosInstance.interceptors.response.use(
   response => response.data,
