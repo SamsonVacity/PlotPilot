@@ -18,6 +18,7 @@ from application.ai.llm_control_service import (
     LLMControlService,
 )
 from infrastructure.ai.provider_factory import LLMProviderFactory
+from infrastructure.ai.url_utils import normalize_openai_base_url
 from infrastructure.ai.prompt_manager import get_prompt_manager, BUILTIN_CATEGORIES
 from interfaces.api.v1.workbench.llm_control_runtime_settings import (
     get_llm_control_runtime_settings,
@@ -62,6 +63,9 @@ def _openai_compatible_models_base(base_url: str) -> str:
     raw = (base_url or '').strip()
     if not raw:
         return default
+    # 与聊天链路（normalize_openai_base_url）保持一致：剥掉多填的
+    # /chat/completions 等后缀，避免拼出 /v1/chat/completions/models 这类 404。
+    raw = normalize_openai_base_url(raw) or raw
     if '://' not in raw:
         raw = f'https://{raw}'
     parsed = urlparse(raw)

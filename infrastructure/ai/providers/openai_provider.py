@@ -164,14 +164,28 @@ class OpenAIProvider(BaseProvider):
 
             if use_responses:
                 try:
-                    # 尝试走 Responses 流式 API
+                    # 尝试走 Responses 流式 API；网关偶发空流（completed 但 0 delta）时自动重试
                     request_kwargs = self._build_responses_request_kwargs(prompt, config, stream=True)
-                    stream = await self.async_client.responses.create(**request_kwargs)
-                    async for chunk in stream:
-                        content = self._extract_text_from_responses_chunk(chunk)
-                        if content:
-                            yield content
-                    return  # 正常完成则结束 generator
+                    for _attempt in range(3):
+                        yielded = 0
+                        stream = await self.async_client.responses.create(**request_kwargs)
+                        async for chunk in stream:
+                            content = self._extract_text_from_responses_chunk(chunk)
+                            if content:
+                                yielded += 1
+                                yield content
+                        if yielded > 0:
+                            return  # 正常完成则结束 generator
+                        logger.warning(
+                            f"[Responses Stream] {base_url} returned empty stream "
+                            f"(attempt {_attempt + 1}/3), retrying..."
+                        )
+                        await asyncio.sleep(1.5)
+                    # 连续空流：不污染降级缓存，仅本次请求降级到 Chat Completions
+                    logger.warning(
+                        f"[Responses Stream] {base_url} empty after retries, "
+                        'falling back to chat completions for this request.'
+                    )
                 except (openai.NotFoundError, openai.BadRequestError):
                     self.__class__._fallback_to_chat_cache.add(base_url)
                     logger.info(f"Stream: Responses API unsupported for {base_url}, falling back.")
@@ -277,11 +291,23 @@ class OpenAIProvider(BaseProvider):
         return kwargs
 
     async def _generate_via_responses(self, prompt: Prompt, config: GenerationConfig) -> GenerationResult:
-        """Responses API 非流式生成"""
+        """Responses API 非流式生成（网关偶发空响应时自动重试，最多 3 次）"""
         request_kwargs = self._build_responses_request_kwargs(prompt, config)
-        response = await self.async_client.responses.create(**request_kwargs)
 
-        content = self._extract_text_from_responses_response(response)
+        response = None
+        content = ""
+        for _attempt in range(3):
+            response = await self.async_client.responses.create(**request_kwargs)
+            content = self._extract_text_from_responses_response(response)
+            if content:
+                break
+            _status = self._response_field(response, "status", "unknown")
+            logger.warning(
+                f"[Responses] empty content (status={_status}, "
+                f"attempt {_attempt + 1}/3), retrying..."
+            )
+            await asyncio.sleep(1.5)
+
         if not content:
             status = self._response_field(response, "status", "unknown")
             incomplete = self._response_field(response, "incomplete_details", None)

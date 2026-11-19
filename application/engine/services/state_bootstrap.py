@@ -546,6 +546,73 @@ class StateBootstrap:
             logger.debug(f"加载编年史失败（可能 Bible/snapshots 不存在）: {novel_id}, {e}")
             return []
 
+    def _load_knowledge(self, novel_id: str) -> Optional[Dict[str, Any]]:
+        """从数据库加载叙事知识（工作台 DB 降级路径专用）。
+
+        返回与前端 StoryKnowledgeDTO 兼容的扁平字典；无数据时返回 None。
+        修复：query_service._fallback_workbench_from_db 调用了本方法但原实现缺失。
+        """
+        try:
+            from infrastructure.persistence.database.sqlite_knowledge_repository import (
+                SqliteKnowledgeRepository,
+            )
+            from infrastructure.persistence.database.connection import get_database
+
+            repo = SqliteKnowledgeRepository(get_database())
+            knowledge = repo.get_by_novel_id(novel_id)
+            if knowledge is None:
+                return None
+
+            chapters_out = []
+            for ch in knowledge.chapters or []:
+                chapters_out.append({
+                    'chapter_id': getattr(ch, 'chapter_id', None),
+                    'summary': getattr(ch, 'summary', ''),
+                    'key_events': list(getattr(ch, 'key_events', []) or []),
+                    'open_threads': list(getattr(ch, 'open_threads', []) or []),
+                    'consistency_note': getattr(ch, 'consistency_note', ''),
+                    'beat_sections': list(getattr(ch, 'beat_sections', []) or []),
+                    'micro_beats': list(getattr(ch, 'micro_beats', []) or []),
+                    'sync_status': getattr(ch, 'sync_status', ''),
+                })
+
+            facts_out = []
+            for f in knowledge.facts or []:
+                facts_out.append({
+                    'id': getattr(f, 'id', ''),
+                    'subject': getattr(f, 'subject', ''),
+                    'predicate': getattr(f, 'predicate', ''),
+                    'object': getattr(f, 'object', ''),
+                    'chapter_id': getattr(f, 'chapter_id', None),
+                    'note': getattr(f, 'note', ''),
+                    'entity_type': getattr(f, 'entity_type', ''),
+                    'importance': getattr(f, 'importance', ''),
+                    'location_type': getattr(f, 'location_type', ''),
+                    'description': getattr(f, 'description', ''),
+                    'first_appearance': getattr(f, 'first_appearance', None),
+                    'related_chapters': list(getattr(f, 'related_chapters', []) or []),
+                    'tags': list(getattr(f, 'tags', []) or []),
+                    'attributes': dict(getattr(f, 'attributes', {}) or {}),
+                    'confidence': getattr(f, 'confidence', None),
+                    'source_type': getattr(f, 'source_type', ''),
+                    'is_starred': bool(getattr(f, 'is_starred', 0)),
+                })
+
+            data = {
+                'novel_id': knowledge.novel_id,
+                'version': knowledge.version,
+                'premise_lock': knowledge.premise_lock,
+                'chapters': chapters_out,
+                'facts': facts_out,
+            }
+            self._shared.set_knowledge(novel_id, data)
+            return data
+
+        except Exception as e:
+            logger.debug(f'加载叙事知识失败: {novel_id}, {e}')
+            return None
+
+
 
 def bootstrap_state() -> Dict[str, Any]:
     """启动时加载所有状态（便捷函数）"""
