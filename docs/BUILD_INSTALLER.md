@@ -57,3 +57,33 @@ npm run tauri build
 ```
 
 直接 `tauri build` 前须已存在冻结目录 `out/tauri/plotpilot-backend/`（含 `plotpilot-backend.exe` 或至少 `.gitkeep` 占位）。
+## 应用内自动更新（updater）
+
+应用已接入 `tauri-plugin-updater`：启动静默检查 + 每 4 小时复查，发现新版本右下角浮条推送（版本号 + 更新说明），确认后下载（带进度）→ 安装 → 自动重启。更新清单固定指向 GitHub Releases：
+
+```
+https://github.com/shenminglinyi/PlotPilot/releases/latest/download/latest.json
+```
+
+### 签名密钥（更新包防篡改）
+
+updater 强制签名校验，公钥已写入 `frontend/src-tauri/tauri.conf.json`（`plugins.updater.pubkey`）。**私钥不在仓库**，由发行维护者保存（离线备份）。
+
+构建签名包需提供环境变量：
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY_PATH` | 私钥文件路径（或用 `TAURI_SIGNING_PRIVATE_KEY` 直接传内容） |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 私钥密码（本 keypair 为空，可省略） |
+
+私钥一旦丢失，老版本将无法校验通过任何新更新包——**离线多备份**。
+
+### 发一次更新的流程
+
+1. 只修改根目录 `VERSION`，然后执行 `python scripts/sync_release_version.py`。脚本会同步前端、Tauri、Cargo 和后端版本。
+2. 首次配置 GitHub Actions 时，将与现有公钥匹配的私钥存为仓库 Secret `TAURI_SIGNING_PRIVATE_KEY`，并将仓库 Variable `ENABLE_SIGNED_UPDATES` 设为 `true`。未开启时，tag 只用于手动 Release，签名工作流会安全跳过。
+3. 提交版本变更，创建与 `VERSION` 一致的 tag，例如 `git tag v4.7.2 && git push origin v4.7.2`。
+4. `.github/workflows/release.yml` 在干净的 Windows 环境构建冻结后端和 NSIS 安装包，签名更新产物，并由 Tauri Action 生成、上传 `latest.json`。
+5. 老客户端自动发现 → 下载并校验签名 → 安全停止后端 → passive 模式安装 → 自动重启。
+
+本地的 `tauri build` 只会生成安装包和签名侧车文件；`latest.json` 由 Tauri Action 结合 GitHub Release 的真实下载 URL 生成，不要手工拼接。

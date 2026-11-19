@@ -54,15 +54,6 @@ class OpenAIProvider(BaseProvider):
         client_kwargs["http_client"] = self._http_client
         self.async_client = AsyncOpenAI(**client_kwargs)
 
-    async def _call_llm_with_timeout(self, coro, operation: str = "LLM call"):
-        """Hard timeout - asyncio.wait_for kills the call even when
-        httpx.Timeout fails (e.g. CLOSE-WAIT after remote FIN)."""
-        timeout = getattr(self.settings, 'timeout_seconds', 300) or 300
-        try:
-            return await asyncio.wait_for(coro, timeout=timeout)
-        except asyncio.TimeoutError:
-            raise RuntimeError("{} timed out after {}s".format(operation, timeout))
-
     async def generate(
         self,
         prompt: Prompt,
@@ -79,8 +70,8 @@ class OpenAIProvider(BaseProvider):
                     logger.info(f"Responses API unsupported for {base_url}, falling back to chat completions: {str(e)}")
                     self.__class__._fallback_to_chat_cache.add(base_url)
                 except Exception as e:
-                    # 某些网关在路径错误时可能不抛严格的 404 而是抛出其他错误，如果消息含有明确路径/空内容错误也尝试降级
-                    if "404" in str(e) or "Not Found" in str(e) or "400" in str(e) or "Account invalid" in str(e) or "INVALID_ARGUMENT" in str(e) or "empty content" in str(e):
+                    # 某些网关在路径错误时可能不抛严格的 404 而是抛出其他错误，如果消息含有明确路径错误也尝试降级
+                    if "404" in str(e) or "Not Found" in str(e) or "400" in str(e) or "Account invalid" in str(e) or "INVALID_ARGUMENT" in str(e):
                         logger.info(f"Gateway returned error for Responses API ({base_url}), falling back: {str(e)}")
                         self.__class__._fallback_to_chat_cache.add(base_url)
                     else:
@@ -110,7 +101,7 @@ class OpenAIProvider(BaseProvider):
             request_kwargs = self._build_chat_request_kwargs(messages, config)
             try:
                 try:
-                    response = await self._call_llm_with_timeout(self.async_client.chat.completions.create(**request_kwargs), "chat.completions.create")
+                    response = await self.async_client.chat.completions.create(**request_kwargs)
                 except (openai.BadRequestError, openai.NotFoundError) as e:
                     # 🔥 json_schema 不支持时自动降级
                     if config.response_format and config.response_format.get("type") == "json_schema":
@@ -121,7 +112,7 @@ class OpenAIProvider(BaseProvider):
                         )
                         self.__class__._json_schema_unsupported_cache.add(base_url)
                         request_kwargs["response_format"] = {"type": "json_object"}
-                        response = await self._call_llm_with_timeout(self.async_client.chat.completions.create(**request_kwargs), "chat.completions.create")
+                        response = await self.async_client.chat.completions.create(**request_kwargs)
                     else:
                         raise
 
@@ -173,14 +164,28 @@ class OpenAIProvider(BaseProvider):
 
             if use_responses:
                 try:
-                    # 尝试走 Responses 流式 API
+                    # 尝试走 Responses 流式 API；网关偶发空流（completed 但 0 delta）时自动重试
                     request_kwargs = self._build_responses_request_kwargs(prompt, config, stream=True)
-                    stream = await self.async_client.responses.create(**request_kwargs)
-                    async for chunk in stream:
-                        content = self._extract_text_from_responses_chunk(chunk)
-                        if content:
-                            yield content
-                    return  # 正常完成则结束 generator
+                    for _attempt in range(3):
+                        yielded = 0
+                        stream = await self.async_client.responses.create(**request_kwargs)
+                        async for chunk in stream:
+                            content = self._extract_text_from_responses_chunk(chunk)
+                            if content:
+                                yielded += 1
+                                yield content
+                        if yielded > 0:
+                            return  # 正常完成则结束 generator
+                        logger.warning(
+                            f"[Responses Stream] {base_url} returned empty stream "
+                            f"(attempt {_attempt + 1}/3), retrying..."
+                        )
+                        await asyncio.sleep(1.5)
+                    # 连续空流：不污染降级缓存，仅本次请求降级到 Chat Completions
+                    logger.warning(
+                        f"[Responses Stream] {base_url} empty after retries, "
+                        'falling back to chat completions for this request.'
+                    )
                 except (openai.NotFoundError, openai.BadRequestError):
                     self.__class__._fallback_to_chat_cache.add(base_url)
                     logger.info(f"Stream: Responses API unsupported for {base_url}, falling back.")
@@ -195,7 +200,7 @@ class OpenAIProvider(BaseProvider):
             # 降级：走原来的 Chat Completions 流式 API
             messages = self._build_messages(prompt)
             request_kwargs = self._build_chat_request_kwargs(messages, config, stream=True)
-            stream = await self._call_llm_with_timeout(self.async_client.chat.completions.create(**request_kwargs), "chat.completions.create (stream)")
+            stream = await self.async_client.chat.completions.create(**request_kwargs)
             async for chunk in stream:
                 content = self._extract_text_from_stream_chunk(chunk)
                 if content:
@@ -286,31 +291,82 @@ class OpenAIProvider(BaseProvider):
         return kwargs
 
     async def _generate_via_responses(self, prompt: Prompt, config: GenerationConfig) -> GenerationResult:
-        """Responses API 非流式生成"""
+        """Responses API 非流式生成（网关偶发空响应时自动重试，最多 3 次）"""
         request_kwargs = self._build_responses_request_kwargs(prompt, config)
-        response = await self._call_llm_with_timeout(self.async_client.responses.create(**request_kwargs), "responses.create")
 
-        output = getattr(response, "output", None)
-        content_parts: list[str] = []
-        if output:
-            for item in output:
-                if getattr(item, "type", "") == "message":
-                    for part in getattr(item, "content", []):
-                        if getattr(part, "type", "") == "text":
-                            piece = str(getattr(part, "text", "")).strip()
-                            if piece:
-                                content_parts.append(piece)
-        content = "\n".join(content_parts).strip()
+        response = None
+        content = ""
+        for _attempt in range(3):
+            response = await self.async_client.responses.create(**request_kwargs)
+            content = self._extract_text_from_responses_response(response)
+            if content:
+                break
+            _status = self._response_field(response, "status", "unknown")
+            logger.warning(
+                f"[Responses] empty content (status={_status}, "
+                f"attempt {_attempt + 1}/3), retrying..."
+            )
+            await asyncio.sleep(1.5)
+
         if not content:
-            raise RuntimeError("Responses API returned empty content")
+            status = self._response_field(response, "status", "unknown")
+            incomplete = self._response_field(response, "incomplete_details", None)
+            reason = self._response_field(incomplete, "reason", "") if incomplete else ""
+            details = f"status={status}"
+            if reason:
+                details += f", incomplete_reason={reason}"
+            raise RuntimeError(f"Responses API returned empty content ({details})")
 
-        input_tokens = response.usage.prompt_tokens if response.usage else 0
-        output_tokens = response.usage.completion_tokens if response.usage else 0
+        usage = self._response_field(response, "usage", None)
+        input_tokens = self._usage_tokens(usage, "input_tokens", "prompt_tokens")
+        output_tokens = self._usage_tokens(usage, "output_tokens", "completion_tokens")
 
         return GenerationResult(
             content=content,
             token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
         )
+
+    @staticmethod
+    def _response_field(value: Any, name: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    @classmethod
+    def _extract_text_from_responses_response(cls, response: Any) -> str:
+        """Extract user-visible text from official SDK and compatible gateways.
+
+        The Responses API uses ``output_text`` content parts.  Some compatible
+        gateways still emit the older ``text`` spelling, so both are accepted.
+        The SDK's aggregate ``response.output_text`` is preferred when present.
+        """
+        aggregate = cls._response_field(response, "output_text", "")
+        if isinstance(aggregate, str) and aggregate.strip():
+            return aggregate.strip()
+
+        content_parts: list[str] = []
+        for item in cls._response_field(response, "output", None) or []:
+            if cls._response_field(item, "type", "") != "message":
+                continue
+            for part in cls._response_field(item, "content", None) or []:
+                if cls._response_field(part, "type", "") not in {"output_text", "text"}:
+                    continue
+                piece = cls._response_field(part, "text", "")
+                if isinstance(piece, str) and piece.strip():
+                    content_parts.append(piece.strip())
+        return "\n".join(content_parts).strip()
+
+    @classmethod
+    def _usage_tokens(cls, usage: Any, primary_name: str, legacy_name: str) -> int:
+        if usage is None:
+            return 0
+        value = cls._response_field(usage, primary_name, None)
+        if value is None:
+            value = cls._response_field(usage, legacy_name, 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _extract_text_from_responses_chunk(chunk: Any) -> str:
@@ -323,7 +379,7 @@ class OpenAIProvider(BaseProvider):
                     return delta
             elif event_type in ("response.content_part.added", "response.content_part.delta"):
                 part = getattr(chunk, "part", None)
-                if part and getattr(part, "type", "") == "text":
+                if part and getattr(part, "type", "") in {"output_text", "text"}:
                     return getattr(part, "text", "")
                 delta = getattr(chunk, "delta", None)
                 if isinstance(delta, str):
@@ -424,9 +480,9 @@ class OpenAIProvider(BaseProvider):
         return ""
 
     async def _generate_via_stream(self, request_kwargs: dict[str, Any]) -> tuple[str, TokenUsage]:
-        stream = await self._call_llm_with_timeout(self.async_client.chat.completions.create(
+        stream = await self.async_client.chat.completions.create(
             **{**request_kwargs, "stream": True}
-        ), "chat.completions.create (stream)")
+        )
 
         parts: list[str] = []
         input_tokens = 0

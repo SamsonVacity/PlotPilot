@@ -184,6 +184,10 @@ class DaemonHostMixin:
                 for key in list(shared.keys()):
                     if key.startswith("novel:") and isinstance(shared[key], dict):
                         shared[key]["_updated_at"] = now
+                # 🔥 每 30s 检查一次共享章节集合是否落后，落后则全量重灌（自愈）
+                if now - getattr(self, "_last_chapter_resync_at", 0.0) >= 30.0:
+                    self._last_chapter_resync_at = now
+                    self._resync_chapters_if_stale(shared)
                 return
         except Exception:
             pass
@@ -395,24 +399,145 @@ class DaemonHostMixin:
             logger.warning("[novel-%s] 推队列失败，数据可能丢失", novel_id.value)
 
 
+    def _open_readonly_connection(self):
+        """真·只读短连接：每次新建，读到 WAL 最新提交后立即关闭。
+
+        ⚠️ 不要用 get_database()：它是线程本地长连接（单例），守护进程里可能
+        停在一个旧的读事务快照上，聚合会返回历史数据（曾导致进度冻结）。
+        """
+        import sqlite3
+        from application.paths import get_db_path
+
+        conn = sqlite3.connect(
+            "file:%s?mode=ro" % get_db_path(), uri=True, timeout=5.0
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _sync_chapter_to_shared(
+        self,
+        novel_id: str,
+        chapter_number: int,
+        title: str,
+        status: str,
+        word_count: int,
+        chapter_id: str = None,
+    ) -> None:
+        """章节落库后同步共享内存的章节集合——/status 的统计源。
+
+        /status 是纯内存接口，completed_chapters / total_words 都由
+        shared 的 `novel:{id}:chapters` 求和得出。落库路径若不更新它，
+        前端进度就会永久停在进程启动那一刻（历史 bug：3 章 / 1.5%）。
+        """
+        try:
+            from application.engine.services.shared_state_repository import (
+                ChapterSummary,
+                get_shared_state_repository,
+            )
+
+            get_shared_state_repository().update_chapter(
+                novel_id,
+                ChapterSummary(
+                    id=chapter_id or ("ch-%s-%s" % (novel_id, chapter_number)),
+                    number=int(chapter_number),
+                    title=title or "",
+                    status=status or "draft",
+                    word_count=int(word_count or 0),
+                ),
+            )
+        except Exception as e:
+            logger.debug(
+                "[%s] 共享内存章节同步失败 ch=%s: %s", novel_id, chapter_number, e
+            )
+
+    def _resync_chapters_if_stale(self, shared) -> None:
+        """共享章节集合落后于 DB 计数时，从 DB 全量重灌（兜底自愈）。
+
+        正常路径由 _sync_chapter_to_shared 增量维护；本方法只处理历史遗留
+        （补丁上线前丢掉的章节）以及任何漏写，保证 /status 最迟 30s 自愈。
+        """
+        try:
+            from application.engine.services.shared_state_repository import (
+                ChapterSummary,
+                get_shared_state_repository,
+            )
+        except Exception as e:
+            logger.debug("自愈：无法导入共享仓: %s", e)
+            return
+
+        repo = get_shared_state_repository()
+        for key in list(shared.keys()):
+            if not isinstance(key, str) or not key.startswith("novel:"):
+                continue
+            nid = key.split(":", 1)[1]
+            if not nid:
+                continue
+            st = shared.get(key)
+            if not isinstance(st, dict):
+                continue
+            expect = int(st.get("current_auto_chapters") or 0)
+            if expect <= 0:
+                continue
+            try:
+                mem = len(repo.get_chapters(nid))
+                if expect <= mem:
+                    continue
+                conn = self._open_readonly_connection()
+                try:
+                    rows = conn.execute(
+                        "SELECT id, number, title, status, word_count FROM chapters "
+                        "WHERE novel_id = ? ORDER BY number",
+                        (nid,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                if len(rows) < expect:
+                    continue
+                repo.set_chapters(
+                    nid,
+                    [
+                        ChapterSummary(
+                            id=r["id"],
+                            number=int(r["number"]),
+                            title=r["title"] or "",
+                            status=r["status"] or "draft",
+                            word_count=int(r["word_count"] or 0),
+                        )
+                        for r in rows
+                    ],
+                )
+                logger.warning(
+                    "[%s] 共享内存章节集合落后（%d < %d），已从 DB 全量重灌 %d 条",
+                    nid,
+                    mem,
+                    expect,
+                    len(rows),
+                )
+            except Exception as e:
+                logger.debug("[%s] 章节集合自愈失败: %s", nid, e)
+
     def _read_chapter_stats_ephemeral(
         self, novel_id: str, timeout: float = 5.0
     ) -> Optional[Tuple[int, int, int]]:
-        """与 /autopilot/status DB 路径一致的章节聚合（短连接只读）。
+        """与 /autopilot/status DB 路径一致的章节聚合（真·只读短连接）。
 
         用于在审计完成、章节落库后刷新共享内存缓存，避免 _cache_stats_to_shared_memory
         用 current_auto_chapters=0 覆盖真实统计导致前端长期显示 0/0/总字数 0。
-        """
-        from application.paths import get_db_path
-        from infrastructure.persistence.database.connection import get_database
 
+        ⚠️ 必须用独立连接：get_database() 是线程本地长连接，守护进程可能停在
+        旧读事务快照上，聚合会返回历史数据（曾导致统计冻结在前 3 章）。
+        """
         try:
-            db = get_database(get_db_path())
-            agg_rows = db.fetch_all(
-                "SELECT status, SUM(LENGTH(COALESCE(content,''))) as total_wc "
-                "FROM chapters WHERE novel_id = ? GROUP BY status",
-                (novel_id,),
-            )
+            conn = self._open_readonly_connection()
+            try:
+                agg_rows = conn.execute(
+                    "SELECT status, SUM(LENGTH(COALESCE(content,''))) as total_wc "
+                    "FROM chapters WHERE novel_id = ? GROUP BY status",
+                    (novel_id,),
+                ).fetchall()
+            finally:
+                conn.close()
             completed_count = 0
             in_manuscript_count = 0
             total_words = 0
@@ -2121,6 +2246,15 @@ class DaemonHostMixin:
             )
             if ok:
                 logger.debug(f"[{novel_id}] 章节已通过短连接落盘: ch={chapter_number} status={status}")
+                # 🔥 同步共享内存章节集合，/status 的进度以此为准
+                self._sync_chapter_to_shared(
+                    novel_id,
+                    chapter_number,
+                    getattr(existing, "title", "") or "",
+                    status,
+                    wc,
+                    chapter_id=getattr(existing, "id", None),
+                )
             else:
                 logger.warning(f"[{novel_id}] 短连接写入失败，已降级到持久化队列: ch={chapter_number}")
         else:
@@ -2143,9 +2277,14 @@ class DaemonHostMixin:
                                              created_at, updated_at)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"""
             # 🔥 CQRS：推队列，由 API 进程消费者串行执行（零锁竞争）
-            self._queue_sql(
+            queued = self._queue_sql(
                 sql, [ch_id, novel_id, chapter_number, ch_title, content_str, ch_outline, ch_status, wc]
             )
+            if queued:
+                # 🔥 同步共享内存章节集合，/status 的进度以此为准
+                self._sync_chapter_to_shared(
+                    novel_id, chapter_number, ch_title, ch_status, wc, chapter_id=ch_id
+                )
 
 
     def _find_parent_volume_for_new_act(

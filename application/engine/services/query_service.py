@@ -336,18 +336,27 @@ class QueryService:
             return self._build_status_from_raw(novel_id, raw_data)
 
         # 计算进度
-        total_words = 0  # 需要从章节累计
         chapters = self._shared.get_chapters(novel_id)
-        completed_chapters = sum(1 for c in chapters if c.status == "completed")
-        total_words = sum(c.word_count for c in chapters)
+        mem_completed = sum(1 for c in chapters if c.status == "completed")
+        total_words = sum(int(c.word_count or 0) for c in chapters)
+        # 防倒退：共享章节集合可能落后于 DB，以 current_auto_chapters 为下界
+        completed_chapters = max(mem_completed, int(state.current_auto_chapters or 0))
+        if chapters and completed_chapters > len(chapters):
+            # 集合不完整时按已有章节的平均字数外推，避免总字数明显偏低
+            total_words = int(round(total_words / len(chapters) * completed_chapters))
 
         progress_pct = 0.0
         if state.target_chapters > 0:
             progress_pct = (completed_chapters / state.target_chapters) * 100
 
-        # 计算当前章节号
+        # 计算当前章节号：以共享章节集合的最大号为准（与 _cached_current_chapter_number 同义）；
+        # 集合为空时才退化到 current_auto_chapters，再不行用 act·in_act 推算
         current_chapter_number = None
-        if state.current_act and state.current_chapter_in_act:
+        if chapters:
+            current_chapter_number = max(int(c.number) for c in chapters)
+        if current_chapter_number is None and state.current_auto_chapters:
+            current_chapter_number = int(state.current_auto_chapters)
+        if current_chapter_number is None and state.current_act and state.current_chapter_in_act:
             current_chapter_number = (state.current_act - 1) * 5 + state.current_chapter_in_act
 
         return NovelStatusResponse(
@@ -384,8 +393,17 @@ class QueryService:
         """从原始数据构建状态响应（兼容旧格式）"""
         # 获取章节信息
         chapters = self._shared.get_chapters(novel_id)
-        completed_chapters = raw_data.get("_cached_completed_chapters", 0) or sum(1 for c in chapters if c.status == "completed")
-        total_words = raw_data.get("_cached_total_words", 0) or sum(c.word_count for c in chapters)
+        mem_completed = sum(1 for c in chapters if c.status == "completed")
+        mem_words = sum(int(c.word_count or 0) for c in chapters)
+        # 三个来源取最大，任何一方落后都不会让进度往回掉
+        completed_chapters = max(
+            mem_completed,
+            int(raw_data.get("_cached_completed_chapters") or 0),
+            int(raw_data.get("current_auto_chapters") or 0),
+        )
+        total_words = mem_words or int(raw_data.get("_cached_total_words") or 0)
+        if chapters and completed_chapters > len(chapters):
+            total_words = int(round(total_words / len(chapters) * completed_chapters))
 
         target_chapters = raw_data.get("target_chapters", 0)
         progress_pct = (completed_chapters / target_chapters * 100) if target_chapters > 0 else 0
